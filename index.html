@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#111827" />
+  <title>Live Face Detection</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: #111827;
+      color: #f9fafb;
+    }
+
+    .page {
+      width: min(1100px, 94vw);
+      margin: 0 auto;
+      padding: 28px 0 40px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(28px, 4vw, 44px);
+    }
+
+    .subtitle {
+      margin: 0 0 22px;
+      color: #cbd5e1;
+      line-height: 1.5;
+    }
+
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+
+    .badge {
+      background: #1f2937;
+      border: 1px solid #374151;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: 700;
+    }
+
+    #faceCount {
+      color: #22c55e;
+    }
+
+    #status {
+      color: #e5e7eb;
+      font-weight: 600;
+    }
+
+    .video-card {
+      position: relative;
+      width: 100%;
+      overflow: hidden;
+      border-radius: 16px;
+      background: #000;
+      border: 1px solid #374151;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+      aspect-ratio: 16 / 9;
+    }
+
+    #webcam,
+    #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    /* Mirror both elements so the visitor sees a natural selfie view. */
+    #webcam,
+    #overlay {
+      transform: scaleX(-1);
+    }
+
+    #overlay {
+      pointer-events: none;
+    }
+
+    .placeholder {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 20px;
+      color: #9ca3af;
+      background: #0b1220;
+      z-index: 0;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 12px 18px;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    #startButton {
+      background: #22c55e;
+      color: #052e16;
+    }
+
+    #stopButton {
+      background: #ef4444;
+      color: white;
+    }
+
+    #fullscreenButton {
+      background: #e5e7eb;
+      color: #111827;
+    }
+
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .notice {
+      margin-top: 18px;
+      padding: 14px 16px;
+      background: #1f2937;
+      border-left: 4px solid #22c55e;
+      border-radius: 8px;
+      color: #d1d5db;
+      line-height: 1.5;
+    }
+
+    .error {
+      color: #fca5a5 !important;
+    }
+
+    @media (max-width: 600px) {
+      .page { width: 96vw; padding-top: 18px; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="page">
+    <h1>📷 Live Face Detection</h1>
+    <p class="subtitle">
+      Click <strong>Start Camera</strong>, allow webcam access, and the app will
+      draw a green box around each detected face.
+    </p>
+
+    <div class="status-row">
+      <div class="badge">Faces Detected: <span id="faceCount">0</span></div>
+      <div id="status">Loading face detector…</div>
+    </div>
+
+    <section class="video-card" id="videoCard">
+      <div class="placeholder" id="placeholder">
+        Camera preview will appear here.
+      </div>
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </section>
+
+    <div class="controls">
+      <button id="startButton" disabled>Start Camera</button>
+      <button id="stopButton" disabled>Stop Camera</button>
+      <button id="fullscreenButton">Full Screen</button>
+    </div>
+
+    <div class="notice">
+      <strong>Privacy:</strong> camera frames are processed in the visitor's
+      browser by this page. This app does not send webcam frames to your own
+      Python/Streamlit server.
+    </div>
+  </main>
+
+  <script type="module">
+    import {
+      FaceDetector,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision";
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("overlay");
+    const ctx = canvas.getContext("2d");
+
+    const startButton = document.getElementById("startButton");
+    const stopButton = document.getElementById("stopButton");
+    const fullscreenButton = document.getElementById("fullscreenButton");
+    const faceCount = document.getElementById("faceCount");
+    const status = document.getElementById("status");
+    const placeholder = document.getElementById("placeholder");
+    const videoCard = document.getElementById("videoCard");
+
+    let faceDetector = null;
+    let mediaStream = null;
+    let animationId = null;
+    let lastVideoTime = -1;
+    let running = false;
+
+    function setStatus(message, isError = false) {
+      status.textContent = message;
+      status.classList.toggle("error", isError);
+    }
+
+    async function initializeDetector() {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm"
+        );
+
+        const options = {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite",
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          minDetectionConfidence: 0.5
+        };
+
+        try {
+          faceDetector = await FaceDetector.createFromOptions(vision, options);
+        } catch (gpuError) {
+          // Fall back to CPU if GPU acceleration is unavailable.
+          options.baseOptions.delegate = "CPU";
+          faceDetector = await FaceDetector.createFromOptions(vision, options);
+        }
+
+        startButton.disabled = false;
+        setStatus("Face detector ready.");
+      } catch (error) {
+        console.error(error);
+        setStatus(
+          "Could not load the face detector. Check your internet connection and refresh.",
+          true
+        );
+      }
+    }
+
+    async function startCamera() {
+      if (!faceDetector) {
+        setStatus("Face detector is still loading. Please wait.", true);
+        return;
+      }
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setStatus("This browser does not support webcam access.", true);
+        return;
+      }
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+
+        video.srcObject = mediaStream;
+        await video.play();
+
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+
+        placeholder.style.display = "none";
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        running = true;
+        lastVideoTime = -1;
+
+        setStatus("Camera running.");
+        predictWebcam();
+      } catch (error) {
+        console.error(error);
+
+        let message = "Camera could not be started.";
+        if (error.name === "NotAllowedError") {
+          message = "Camera permission was blocked. Allow camera access in your browser and try again.";
+        } else if (error.name === "NotFoundError") {
+          message = "No camera was found on this device.";
+        } else if (error.name === "NotReadableError") {
+          message = "The camera may already be in use by another application.";
+        }
+
+        setStatus(message, true);
+      }
+    }
+
+    function drawDetections(detections) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      faceCount.textContent = detections.length;
+
+      ctx.lineWidth = Math.max(3, canvas.width / 320);
+      ctx.strokeStyle = "#00ff4c";
+      ctx.fillStyle = "#00ff4c";
+      ctx.font = `${Math.max(20, Math.round(canvas.width / 40))}px Arial`;
+      ctx.textBaseline = "bottom";
+
+      for (const detection of detections) {
+        const box = detection.boundingBox;
+        const confidence = detection.categories?.[0]?.score ?? 0;
+
+        ctx.strokeRect(
+          box.originX,
+          box.originY,
+          box.width,
+          box.height
+        );
+
+        const label = `Face ${Math.round(confidence * 100)}%`;
+        const labelY = Math.max(box.originY - 6, 28);
+
+        ctx.save();
+        // Counter-mirror the text so labels read normally while the canvas is mirrored.
+        ctx.translate(canvas.width, 0);
+        ctx.scale(-1, 1);
+
+        const textX = canvas.width - box.originX - box.width;
+        ctx.fillText(label, textX, labelY);
+        ctx.restore();
+      }
+    }
+
+    function predictWebcam() {
+      if (!running || !faceDetector) return;
+
+      if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+
+        const result = faceDetector.detectForVideo(
+          video,
+          performance.now()
+        );
+
+        drawDetections(result.detections || []);
+      }
+
+      animationId = requestAnimationFrame(predictWebcam);
+    }
+
+    function stopCamera() {
+      running = false;
+
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+        animationId = null;
+      }
+
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      video.srcObject = null;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      faceCount.textContent = "0";
+      placeholder.style.display = "grid";
+      startButton.disabled = false;
+      stopButton.disabled = true;
+
+      setStatus("Camera stopped.");
+    }
+
+    async function toggleFullscreen() {
+      try {
+        if (!document.fullscreenElement) {
+          await videoCard.requestFullscreen();
+        } else {
+          await document.exitFullscreen();
+        }
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    startButton.addEventListener("click", startCamera);
+    stopButton.addEventListener("click", stopCamera);
+    fullscreenButton.addEventListener("click", toggleFullscreen);
+
+    window.addEventListener("beforeunload", stopCamera);
+
+    initializeDetector();
+  </script>
+</body>
+</html>
